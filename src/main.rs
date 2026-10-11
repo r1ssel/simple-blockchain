@@ -3,6 +3,11 @@
 use serde::{Serialize, Deserialize};
 use sha2::{Sha256, Digest};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Transaction {
@@ -25,7 +30,7 @@ impl Transaction {
 struct Block {
     index: u64,
     timestamp: u128,
-    transaction: Vec<Transaction>,
+    transactions: Vec<Transaction>,
     prev_hash: String,
     nonce: u64,
     hash: String,
@@ -33,7 +38,7 @@ struct Block {
 
 impl Block {
     fn calculate_hash(&self) -> String {
-        let txs = serde_json::to_string(&self.transaction).unwrap();
+        let txs = serde_json::to_string(&self.transactions).unwrap();
         let input = format!(
             "{}{}{}{}{}",
             self.index, self.timestamp, txs, self.prev_hash, self.nonce
@@ -66,8 +71,8 @@ impl Blockchain {
     fn create_genesis_block(&self) -> Block {
         let mut block = Block {
             index: 0,
-            timestamp: now(),
-            transaction: vec![],
+            timestamp: 0,
+            transactions: vec![],
             prev_hash: "0".repeat(64),
             nonce: 0,
             hash: String::new(),
@@ -103,14 +108,14 @@ impl Blockchain {
         let mut block = Block {
             index: prev.index + 1,
             timestamp: now(),
-            transaction: txs,
+            transactions: txs,
             prev_hash: prev.hash.clone(),
             nonce: 0,
             hash: String::new(),
         };
         block.mine(self.difficulty);
         println!("Блок #{} замайнен: {} ({} транзакций)",
-                 block.index, block.hash, block.transaction.len());
+                 block.index, block.hash, block.transactions.len());
         self.chain.push(block);
     }
 
@@ -131,6 +136,71 @@ impl Blockchain {
     }
 }
 
+fn serialize_chain(chain: &Vec<Block>) -> String {
+    serde_json::to_string(chain).unwrap() + "\n"
+}
+
+async fn handle_peer(mut stream: TcpStream, bc: Arc<Mutex<Blockchain>>) {
+    let mut buf = vec![0u8; 65536];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let msg = String::from_utf8_lossy(&buf[..n]).to_string();
+                //println!("Получено {} байт", n);
+                if let Ok(incoming_chain) = serde_json::from_str::<Vec<Block>>(&msg) {
+                    //println!("Распарсено {} блоков", incoming_chain.len());
+                    let mut local = bc.lock().await;
+                    //println!("Локально {} блоков", local.chain.len());
+                    if incoming_chain.len() > local.chain.len() && is_chain_valid(&incoming_chain) {
+                        //println!("Принятая цепочка длиннее локальной");
+                        if is_chain_valid(&incoming_chain) {
+                            println!("Принята цепочка от соседа: {} блоков", incoming_chain.len());
+                                for block in &incoming_chain {
+                                    println!(
+                                        "  Блок #{}: {} транзакций, hash={}",
+                                        block.index,
+                                        block.transactions.len(),
+                                        &block.hash[..16]
+                                        );
+                                }
+                            local.chain = incoming_chain;
+                        } else {
+                            println!("Цепочка невалидна");
+                        }
+                    }
+                    else {
+                        println!("Цепочка от соседа короче");
+                    }
+                } 
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn is_chain_valid(chain: &Vec<Block>) -> bool {
+    for i in 1..chain.len() {
+        let current = &chain[i];
+        let prev = &chain[i - 1];
+        if current.hash != current.calculate_hash() {
+            return false;
+        }
+        if current.prev_hash != prev.hash {
+            return false;
+        }
+    }
+    return true
+}
+
+async fn broadcast_chain(peer_addr: &str, chain: &Vec<Block>) {
+    if let Ok(mut stream) = TcpStream::connect(peer_addr).await {
+        let msg = serialize_chain(chain);
+        let _ = stream.write_all(msg.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    }
+}
+
 fn now() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -138,24 +208,62 @@ fn now() -> u128 {
         .as_millis()
 }
 
-fn main() {
-    let mut bc = Blockchain::new(4);
+#[tokio::main]
+async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let my_port = &args[1];
+    let peer_addr = &args[2];
 
-    // Добавляем транзакции в mempool
-    bc.add_transaction(Transaction::new("Алиса", "Боб", 10));
-    bc.add_transaction(Transaction::new("Боб", "Чарли", 5));
-    bc.add_transaction(Transaction::new("Чарли", "Алиса", 2));
+    let bc = Arc::new(Mutex::new(Blockchain::new(4)));
+    
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", my_port)).await.unwrap();
+    println!("Узел слушает на порту {}", my_port);
 
-    // Майним блок — все три транзакции попадут в один блок
-    bc.mine_block();
+    let bc_clone = bc.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                let bc_inner = bc_clone.clone();
+                tokio::spawn(handle_peer(stream, bc_inner));
+            }
+        }
+    });
 
-    // Ещё транзакции
-    bc.add_transaction(Transaction::new("Алиса", "Чарли", 1));
-    bc.mine_block();
+    loop {
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+        let cmd = input.trim();
 
-    println!("\nЦепочка валидна: {}", bc.is_valid());
-    println!("Блоков: {}", bc.chain.len());
-    for b in &bc.chain {
-        println!("  Блок #{}: {} транзакций, hash={}", b.index, b.transaction.len(), &b.hash[..16]);
+        if cmd == "mine" {
+            {
+                let mut local = bc.lock().await;
+                if local.mempool.is_empty() {
+                    println!("Mempool пуст!");
+                    continue;
+                }
+                local.mine_block();
+            }
+            let local = bc.lock().await;
+            broadcast_chain(peer_addr, &local.chain).await;
+            println!("Цепочка отправлена соседу {}", peer_addr);
+        } else if cmd.starts_with("tx ") {
+            let parts: Vec<&str> = cmd.split_whitespace().collect();
+            if parts.len() == 4 {
+                let amount = parts[3].parse().unwrap();
+                let mut local = bc.lock().await;
+                local.add_transaction(Transaction::new(
+                    parts[1], parts[2], amount
+                ));
+            }
+        } else if cmd == "show" {
+            let local = bc.lock().await;
+            println!("Блоков: {}", local.chain.len());
+            for b in &local.chain {
+                println!("  #{}: {} tx, hash={}", b.index, b.transactions.len(), &b.hash[..16]);
+                for t in &b.transactions {
+                    println!("   {} -> {}: {}", t.from, t.to, t.amount);
+                }
+            }
+        }
     }
 }
