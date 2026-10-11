@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 use std::thread::sleep;
 use std::io::{self, Write};
 use tokio::sync::Mutex;
+use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
+use rand::rngs::OsRng;
+use base64::{engine::general_purpose, Engine as _};
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,15 +20,54 @@ struct Transaction {
     from: String,
     to: String,
     amount: u64,
+    pub_key: String,
+    signature: String,
+    timestamp: u128,
 }
 
 impl Transaction {
-    fn new(from: &str, to: &str, amount: u64) -> Self {
+    fn new_signed(signing_key: &SigningKey, to: &str, amount: u64) -> Self {
+        let from = general_purpose::STANDARD.encode(signing_key.verifying_key().as_bytes());
+        let timestamp = now();
+
+        let msg = format!("{}{}{}{}", from, to, amount, timestamp);
+        let signature = signing_key.sign(msg.as_bytes());
+        let signature_b64 = general_purpose::STANDARD.encode(signature.to_bytes());
+        let pub_key_b64 = general_purpose::STANDARD.encode(signing_key.verifying_key().as_bytes());
+
         Transaction {
-            from: from.to_string(),
+            from,
             to: to.to_string(),
-            amount: amount,
+            amount,
+            pub_key: pub_key_b64,
+            signature: signature_b64,
+            timestamp,
         }
+    }
+
+    fn verify(&self) -> bool {
+        let pub_key_bytes = match general_purpose::STANDARD.decode(&self.pub_key) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+
+        let pub_key = match VerifyingKey::from_bytes(&pub_key_bytes.try_into().unwrap_or([0u8; 32])) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+
+        let sig_bytes = match general_purpose::STANDARD.decode(&self.signature) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+
+        let signature = match Signature::from_slice(&sig_bytes) {
+           Ok(s) => s,
+           Err(_) => return false,
+        };
+
+        let msg = format!("{}{}{}{}", self.from, self.to, self.amount, self.timestamp);
+        pub_key.verify(msg.as_bytes(), &signature).is_ok()
     }
 }
 
@@ -58,7 +100,7 @@ impl Block {
         let mut attempts: u64 = 0;
 
         // Ожидаемое число попыток: 16^difficulty
-        let expected: f64 = 16_f64.powi(difficulty as i32);
+        let expected: f64 = (16_f64.powi(difficulty as i32))*10.0;
         let bar_width = 40;
 
         loop {
@@ -66,7 +108,7 @@ impl Block {
             attempts += 1;
 
             // Считаем прогресс как долю от ожидаемого числа попыток
-            let progress = (attempts as f64 / expected*2.0).min(1.0);
+            let progress = (attempts as f64 / expected).min(1.0);
             let filled = (progress * bar_width as f64) as usize;
 
             let bar = format!(
@@ -83,7 +125,7 @@ impl Block {
             if self.hash.starts_with(&target) {
                 let elapsed = start.elapsed();
                 print!("\r\x1b[2K");
-                println!(" Найдено за {} попыток", attempts);
+                println!("  Найдено за {} попыток", attempts);
                 println!("  Время: {:.2?}", elapsed);
                 break;
             }
@@ -123,9 +165,16 @@ impl Blockchain {
         bc
     }
 
-    fn add_transaction(&mut self, tx: Transaction) {
-        println!{"Транзакция добавлена в mempool: {} -> {}({})", tx.from, tx.to, tx.amount};
+    fn add_transaction(&mut self, tx: Transaction) -> bool {
+        if !tx.verify() {
+            println!("Транзакция отклонена: неверная подпись");
+            return false;
+        }
+        let from_short = &tx.from[..tx.from.len().min(8)];
+        let to_short = &tx.to[..tx.to.len().min(8)];
+        println!("Транзакция добавлена в mempool: {} -> {} ({})", from_short, to_short, tx.amount); 
         self.mempool.push(tx);
+        return true
     }
 
     fn mine_block(&mut self) {
@@ -149,23 +198,25 @@ impl Blockchain {
         println!("Блок #{} замайнен: {} ({} транзакций)",
                  block.index, block.hash, block.transactions.len());
         self.chain.push(block);
-    }
+    } 
+}
 
-    fn is_valid(&self) -> bool {
-        for i in 1..self.chain.len() {
-            let current = &self.chain[i];
-            let prev = &self.chain[i - 1];
+fn is_chain_valid(chain: &Vec<Block>) -> bool {
+    for i in 1..chain.len() {
+        let current = &chain[i];
+        let prev = &chain[i - 1];
 
-            if current.hash != current.calculate_hash() {
-                return false;
-            }
-            
-            if current.prev_hash != prev.hash {
-                return false;
-            }
+        if current.hash != current.calculate_hash() {
+            println!("Блок #{}: хэш не совпадает", current.index);
+            return false;
         }
-        true
+
+        if current.prev_hash != prev.hash {
+            println!("Блок #{}: prev_hash не совпадает", current.index);
+            return false;
+        }
     }
+    true
 }
 
 fn serialize_chain(chain: &Vec<Block>) -> String {
@@ -211,20 +262,6 @@ async fn handle_peer(mut stream: TcpStream, bc: Arc<Mutex<Blockchain>>) {
     }
 }
 
-fn is_chain_valid(chain: &Vec<Block>) -> bool {
-    for i in 1..chain.len() {
-        let current = &chain[i];
-        let prev = &chain[i - 1];
-        if current.hash != current.calculate_hash() {
-            return false;
-        }
-        if current.prev_hash != prev.hash {
-            return false;
-        }
-    }
-    return true
-}
-
 async fn broadcast_chain(peer_addr: &str, chain: &Vec<Block>) {
     if let Ok(mut stream) = TcpStream::connect(peer_addr).await {
         let msg = serialize_chain(chain);
@@ -246,7 +283,14 @@ async fn main() {
     let my_port = &args[1];
     let peer_addr = &args[2];
 
-    let bc = Arc::new(Mutex::new(Blockchain::new(4)));
+    let mut csprng = OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    let my_address = general_purpose::STANDARD.encode(signing_key.verifying_key().as_bytes());
+    
+    println!("Мой адрес: {}", my_address);
+    println!("(первые 16 символов: {})", &my_address[..16]);
+
+    let bc = Arc::new(Mutex::new(Blockchain::new(6)));
     
     let listener = TcpListener::bind(format!("127.0.0.1:{}", my_port)).await.unwrap();
     println!("Узел слушает на порту {}", my_port);
@@ -278,16 +322,20 @@ async fn main() {
             let local = bc.lock().await;
             broadcast_chain(peer_addr, &local.chain).await;
             println!("Цепочка отправлена соседу {}", peer_addr);
-        } else if cmd.starts_with("tx ") {
+        } 
+        else if cmd.starts_with("tx ") {
             let parts: Vec<&str> = cmd.split_whitespace().collect();
-            if parts.len() == 4 {
-                let amount = parts[3].parse().unwrap();
+            if parts.len() == 3 {
+                let to = parts[1];
+                let amount = parts[2].parse().unwrap();
+                let tx = Transaction::new_signed(&signing_key, to, amount);
                 let mut local = bc.lock().await;
-                local.add_transaction(Transaction::new(
-                    parts[1], parts[2], amount
-                ));
+                local.add_transaction(tx);
+            } else {
+                println!("Формат: tx <кому> <сумма>");
             }
-        } else if cmd == "show" {
+        } 
+        else if cmd == "show" {
             let local = bc.lock().await;
             println!("Блоков: {}", local.chain.len());
             for b in &local.chain {
@@ -296,7 +344,8 @@ async fn main() {
                     println!("   {} -> {}: {}", t.from, t.to, t.amount);
                 }
             }
-        } else if cmd == "chain" {
+        } 
+        else if cmd == "chain" {
             let local = bc.lock().await;
             let mut count: u64 = 1;
             for b in &local.chain {  
