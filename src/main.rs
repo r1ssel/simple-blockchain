@@ -1,6 +1,6 @@
 #![allow(dead_code, unused_variables, unused_imports)]
 
-use serde::{Serilize, Deserialize};
+use serde::{Serialize, Deserialize};
 use sha2::{Sha256, Digest};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,9 +14,9 @@ struct Transaction {
 impl Transaction {
     fn new(from: &str, to: &str, amount: u64) -> Self {
         Transaction {
-            from.to_string(),
-            to.to_string(),
-            amount,
+            from: from.to_string(),
+            to: to.to_string(),
+            amount: amount,
         }
     }
 }
@@ -36,7 +36,7 @@ impl Block {
         let txs = serde_json::to_string(&self.transaction).unwrap();
         let input = format!(
             "{}{}{}{}{}",
-            self.index, self.timestamp, self.txs, self.prev_hash, self.nonce
+            self.index, self.timestamp, txs, self.prev_hash, self.nonce
         );
         // println!("{}", input);
         let mut hasher = Sha256::new();
@@ -86,27 +86,33 @@ impl Blockchain {
         bc
     }
 
-    fn add_tranaction(&mut self, tx: Transaction) {
+    fn add_transaction(&mut self, tx: Transaction) {
         println!{"Транзакция добавлена в mempool: {} -> {}({})", tx.from, tx.to, tx.amount};
         self.mempool.push(tx);
     }
-    
-    fn add_block(&mut self, data: String) {
+
+    fn mine_block(&mut self) {
+        if self.mempool.is_empty() {
+            println!("Mempool пуст");
+            return;
+        }
+        
         let prev = self.chain.last().unwrap();
+        let txs = std::mem::take(&mut self.mempool);
+        
         let mut block = Block {
             index: prev.index + 1,
             timestamp: now(),
-            data,
+            transaction: txs,
             prev_hash: prev.hash.clone(),
             nonce: 0,
             hash: String::new(),
         };
         block.mine(self.difficulty);
-        println!("Блок №{} найден: {}", block.index, block.hash);
+        println!("Блок #{} замайнен: {} ({} транзакций)",
+                 block.index, block.hash, block.transaction.len());
         self.chain.push(block);
     }
-
-    
 
     fn is_valid(&self) -> bool {
         for i in 1..self.chain.len() {
@@ -114,6 +120,10 @@ impl Blockchain {
             let prev = &self.chain[i - 1];
 
             if current.hash != current.calculate_hash() {
+                return false;
+            }
+            
+            if current.prev_hash != prev.hash {
                 return false;
             }
         }
@@ -128,17 +138,24 @@ fn now() -> u128 {
         .as_millis()
 }
 
-fn main() {   
+fn main() {
     let mut bc = Blockchain::new(4);
 
-    println!("Майним блоки...");
-    bc.add_block("Адиса -> Боб: 10 монет".to_string());
-    bc.add_block("Боб -> Чарли: 5 монет".to_string()); 
-    bc.add_block("Чарли -> Алиса: 10 монет".to_string());
-    println!("\nЦепочка валидна: {}", bc.is_valid());
+    // Добавляем транзакции в mempool
+    bc.add_transaction(Transaction::new("Алиса", "Боб", 10));
+    bc.add_transaction(Transaction::new("Боб", "Чарли", 5));
+    bc.add_transaction(Transaction::new("Чарли", "Алиса", 2));
 
-    // Ломаем цепочку: меняем данные во втором блоке
-    println!("\n--- Подделываем данные в блоке #1 ---");
-    bc.chain[1].data = "Алиса -> Боб: 1000000 монет".to_string();
-    println!("Цепочка валидна после подделки: {}", bc.is_valid()); 
+    // Майним блок — все три транзакции попадут в один блок
+    bc.mine_block();
+
+    // Ещё транзакции
+    bc.add_transaction(Transaction::new("Алиса", "Чарли", 1));
+    bc.mine_block();
+
+    println!("\nЦепочка валидна: {}", bc.is_valid());
+    println!("Блоков: {}", bc.chain.len());
+    for b in &bc.chain {
+        println!("  Блок #{}: {} транзакций, hash={}", b.index, b.transaction.len(), &b.hash[..16]);
+    }
 }
