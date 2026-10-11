@@ -6,6 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use std::thread::sleep;
+use std::io::{self, Write};
 use tokio::sync::Mutex;
 
 
@@ -51,14 +54,43 @@ impl Block {
     
     fn mine(&mut self, difficulty: usize) {
         let target = "0".repeat(difficulty);
+        let start = Instant::now();
+        let mut attempts: u64 = 0;
+
+        // Ожидаемое число попыток: 16^difficulty
+        let expected: f64 = 16_f64.powi(difficulty as i32);
+        let bar_width = 40;
+
         loop {
             self.hash = self.calculate_hash();
+            attempts += 1;
+
+            // Считаем прогресс как долю от ожидаемого числа попыток
+            let progress = (attempts as f64 / expected*2.0).min(1.0);
+            let filled = (progress * bar_width as f64) as usize;
+
+            let bar = format!(
+                "[{}{}] {:.2}% | попыток: {}",
+                "█".repeat(filled),
+                "░".repeat(bar_width - filled),
+                progress * 100.0,
+                attempts
+            );
+
+            print!("\r\x1b[2K{}", bar);
+            io::stdout().flush().unwrap();
+
             if self.hash.starts_with(&target) {
+                let elapsed = start.elapsed();
+                print!("\r\x1b[2K");
+                println!(" Найдено за {} попыток", attempts);
+                println!("  Время: {:.2?}", elapsed);
                 break;
             }
+
             self.nonce += 1;
         }
-    }
+    } 
 }
 
 struct Blockchain {
@@ -262,6 +294,15 @@ async fn main() {
                 println!("  #{}: {} tx, hash={}", b.index, b.transactions.len(), &b.hash[..16]);
                 for t in &b.transactions {
                     println!("   {} -> {}: {}", t.from, t.to, t.amount);
+                }
+            }
+        } else if cmd == "chain" {
+            let local = bc.lock().await;
+            let mut count: u64 = 1;
+            for b in &local.chain {  
+                for t in &b.transactions {
+                    println!(" tx#{} {} -> {} {}\n", count, t.from, t.to, t.amount);
+                    count+=1;
                 }
             }
         }
